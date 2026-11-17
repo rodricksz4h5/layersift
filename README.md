@@ -64,9 +64,15 @@ hermes plugins install rodricksz4h5/layersift --enable
 - Reading a layer means reading every tar header in it with Python's `tarfile`:
   under a second for a typical image, a few seconds for one with hundreds of
   thousands of files.
-- An archive whose contents declare more than 64 GiB, or more than 3 million tar
-  entries, is refused before it is read; a crafted compressed archive therefore costs
-  at most a few minutes of reading.
+- An archive is refused once reading it would need more than 64 GiB decompressed,
+  more than 1.5 million tar entries, or more than 256 MiB of entry names (any single
+  name over 4096 bytes is refused). Each tar header is checked before its contents
+  are read, and a compressed archive is read once, so a crafted one costs at most a
+  few minutes (about 1-3 seconds per GiB) and bounded memory. Contents skipped in
+  an uncompressed archive are not read and do not count.
+- `image` picks an image by tag (`myapp:1`, `docker.io/library/myapp:1` and podman's
+  `localhost/myapp:1` are the same image), by digest (`myapp@sha256:...`), or by
+  platform (`linux/arm64`). A name matching nothing, or several images, is an error.
 - An archive that names the same layer file twice is refused as ambiguous.
 - Leftover findings are path patterns; a cache directory the image needs at run time
   will still be reported.

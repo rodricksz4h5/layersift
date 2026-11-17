@@ -36,14 +36,17 @@ import re
 import stat
 import sys
 import tarfile
+import zlib
 from collections import defaultdict
 from typing import Any, Optional
 
 # --- Bounds ---------------------------------------------------------------------------
 MAX_ARCHIVE_BYTES = 64 * 1024 ** 3       # the saved tar itself
 MAX_JSON_BYTES = 8 * 1024 * 1024         # manifest, index and config documents
-MAX_UNPACKED_BYTES = 64 * 1024 ** 3      # contents declared per archive and across its layers (~2.5 s/GiB to read)
-MAX_ENTRIES = 3_000_000                  # tar entries across all layers
+MAX_UNPACKED_BYTES = 64 * 1024 ** 3      # bytes actually decompressed or read (~1.2-2.9 s/GiB)
+MAX_ENTRIES = 1_500_000                  # tar entries in the archive and its layers together
+MAX_NAME = 4096                          # one entry name (PATH_MAX): runtimes cannot unpack longer
+MAX_NAME_TOTAL = 256 * 1024 * 1024       # all entry names kept in memory
 MAX_LAYERS = 1_000
 MAX_META_BYTES = 64 * 1024 * 1024        # all JSON-looking members kept from one archive
 MAX_HEADER_BYTES = 1024 * 1024           # one long-name or pax extended header
@@ -150,9 +153,13 @@ def _decompressed(fileobj: Any, comp: str) -> Any:
     return fileobj
 
 
+class _Unsupported(ValueError):
+    """A stream this Python cannot read (zstd before 3.14): fatal only if the image needs it."""
+
+
 def _check_codec(comp: str, what: str) -> None:
     if comp == "zstd" and sys.version_info < (3, 14):
-        raise ValueError(f"{what} is zstd-compressed, which Python reads from 3.14 on; "
+        raise _Unsupported(f"{what} is zstd-compressed, which Python reads from 3.14 on; "
                          "decompress it first (zstd -d) or save the image uncompressed")
 
 
@@ -197,26 +204,35 @@ def _tar(fileobj: Any, mode: str) -> tarfile.TarFile:
 
 
 class _Budget:
-    """Caps the work a crafted archive can cause: entries, and the file bytes headers
-    declare, charged at each header before its data is read or decompressed. There is no
-    ratio test: a real layer of zeros (a sparse lastlog) compresses about 1000:1, as a
-    bomb does; the absolute cap is what bounds the time a stream can take."""
+    """Caps the work and memory a crafted archive can cause, for one whole load: the
+    archive and its layers share it. Each tar header is charged before its data is
+    touched: one entry, its name, and its declared size when that data will actually
+    be decompressed or read (contents skipped by seeking cost nothing, so they are not
+    charged). There is no ratio test: a real layer of zeros (a sparse lastlog)
+    compresses about 1000:1, as a bomb does; the absolute caps bound the time."""
 
     def __init__(self, what: str) -> None:
         self.what = what
         self.entries = 0
         self.bytes = 0
+        self.names = 0
 
-    def charge(self, size: int) -> None:
-        if size < 0:
+    def charge(self, m: tarfile.TarInfo, streamed: bool) -> None:
+        if m.size < 0:
             raise ValueError("a tar header declares a negative size; refusing the archive")
+        if len(m.name) > MAX_NAME or len(m.linkname) > MAX_NAME:
+            raise ValueError(f"a tar entry name is longer than {MAX_NAME} bytes; refusing the archive")
         self.entries += 1
-        self.bytes += size
+        self.names += len(m.name) + len(m.linkname)
+        if streamed:
+            self.bytes += m.size
         if self.entries > MAX_ENTRIES:
             raise ValueError(f"more than {MAX_ENTRIES} entries in {self.what}; refusing to read further")
+        if self.names > MAX_NAME_TOTAL:
+            raise ValueError(f"the entry names in {self.what} add up to more than {MAX_NAME_TOTAL // MIB} MiB; refusing")
         if self.bytes > MAX_UNPACKED_BYTES:
-            raise ValueError(f"{self.what} declares more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB of "
-                             "contents; refusing to read further")
+            raise ValueError(f"{self.what} would need more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB decompressed "
+                             "or read; refusing to read further")
 
 
 def _norm(name: str) -> str:
@@ -241,7 +257,7 @@ class Layer:
         self.files = 0
 
     def copy_from(self, other: "Layer") -> None:
-        for k in ("archive_bytes", "compression", "adds", "whiteouts", "opaque", "size", "files"):
+        for k in ("compression", "adds", "whiteouts", "opaque", "size", "files"):
             setattr(self, k, getattr(other, k))
 
 
@@ -250,12 +266,13 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
     if not head:
         return
     comp = layer.compression = _compression(head)
-    _check_codec(comp, f"layer {layer.index}")
+    _check_codec(comp, f"layer {layer.index or layer.ref}")
     try:
         seekable = bool(fobj.seekable())
     except (AttributeError, OSError):   # a member of a compressed archive read as a stream
         seekable = False
-    if comp == "none" and seekable:
+    streamed = not (comp == "none" and seekable)
+    if not streamed:
         fobj.seek(0)   # uncompressed and seekable: skip file contents instead of reading them
         tf = _tar(fobj, "r:")
     else:
@@ -265,7 +282,7 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
             # TarFile keeps every header it has read; a layer can hold hundreds of
             # thousands. Nothing here needs them again, so do not let them pile up.
             tf.members.clear()
-            budget.charge(m.size)
+            budget.charge(m, streamed)
             p = _norm(m.name)
             if not p:
                 continue
@@ -358,6 +375,9 @@ def _platform(p: Any) -> Optional[str]:
     return None
 
 
+_DROPPED = object()
+
+
 class _Docs:
     """JSON members kept as bytes in pass 1 and parsed only when an image refers to them,
     so a crafted archive full of large JSON files costs a byte cap, not a parse each."""
@@ -369,19 +389,25 @@ class _Docs:
         self.total = 0
 
     def keep(self, name: str, data: bytes) -> None:
+        # A later copy of a name replaces the earlier one, as unpacking would.
+        old = self.raw.pop(name, None)
+        if old is not None:
+            self.total -= len(old)
+        self.parsed.pop(name, None)
+        self.dropped.discard(name)
         # Past the cap, later documents are not kept (attestation and SBOM blobs can be
-        # large and are never read); it is an error only if an image then needs one.
+        # large and are never read); it is an error only if the chosen image needs one.
         if self.total + len(data) > MAX_META_BYTES:
             self.dropped.add(name)
             return
         self.total += len(data)
         self.raw[name] = data
-        self.parsed.pop(name, None)
 
-    def get(self, name: Any) -> Any:
-        if isinstance(name, str) and name in self.dropped and name not in self.raw:
-            raise ValueError(f"the archive holds more than {MAX_META_BYTES // MIB} MiB of JSON documents and "
-                             f"{name}, which the image needs, is past that limit; refusing")
+    def get(self, name: Any, strict: bool = True) -> Any:
+        if isinstance(name, str) and name in self.dropped:
+            if strict:
+                raise ValueError(_dropped_error(name))
+            return _DROPPED
         if not isinstance(name, str) or name not in self.raw:
             return None
         if name not in self.parsed:
@@ -392,46 +418,76 @@ class _Docs:
         return self.parsed[name]
 
 
-def _images(docs: _Docs) -> list:
-    """Every image the archive holds: tags, config member, layer members (bottom first)."""
+def _dropped_error(name: str) -> str:
+    return (f"the archive holds more than {MAX_META_BYTES // MIB} MiB of JSON documents and {name}, "
+            "which the image needs, is past that limit; refusing")
+
+
+def _config_digest(member: Optional[str]) -> Optional[str]:
+    """sha256:<hex> from a config member name: <hex>.json (classic) or blobs/sha256/<hex>."""
+    m = re.search(r"(?:^|/)(?:(sha256|sha512)/)?([0-9a-f]{64}|[0-9a-f]{128})(?:\.json)?$", member or "")
+    return f"{m.group(1) or 'sha256'}:{m.group(2)}" if m else None
+
+
+def _oci_images(docs: _Docs, index: dict) -> list:
     out = []
+    todo = [(d, None, None) for d in index.get("manifests") or [] if isinstance(d, dict)]
+    seen = 0
+    while todo and seen < 256:
+        seen += 1
+        desc, tag, top = todo.pop(0)
+        ann = desc.get("annotations") if isinstance(desc.get("annotations"), dict) else {}
+        tag = ann.get("io.containerd.image.name") or ann.get("org.opencontainers.image.ref.name") or tag
+        digest = desc.get("digest") if isinstance(desc.get("digest"), str) else None
+        top = top or digest
+        plat = _platform(desc.get("platform"))
+        if plat == "unknown/unknown":   # buildx attestation manifests: never fetched
+            continue
+        digests = {d for d in (digest, top) if d}
+        tags = [tag] if isinstance(tag, str) else []
+        doc = docs.get(_blob_path(digest), strict=False)
+        if doc is _DROPPED:
+            out.append({"tags": tags, "platform": plat, "config": None, "layers": [], "layer_digests": [],
+                        "digests": digests, "dropped": _blob_path(digest)})
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if isinstance(doc.get("manifests"), list):   # an index: one manifest per platform
+            todo.extend((d, tag, top) for d in doc["manifests"] if isinstance(d, dict))
+            continue
+        if isinstance(doc.get("layers"), list):
+            cfg = doc.get("config") if isinstance(doc.get("config"), dict) else {}
+            if isinstance(cfg.get("digest"), str):
+                digests.add(cfg["digest"])
+            layers = [d for d in doc["layers"] if isinstance(d, dict)]
+            out.append({"tags": tags, "platform": plat, "config": _blob_path(cfg.get("digest")),
+                        "layers": [_blob_path(d.get("digest")) or "" for d in layers],
+                        "layer_digests": [d.get("digest") for d in layers], "digests": digests})
+    return out
+
+
+def _images(docs: _Docs) -> list:
+    """Every image the archive holds: tags, config member, layer members (bottom first),
+    and the digests (manifest, index, config) a reference by digest may name."""
     manifest = docs.get("manifest.json")
+    index = docs.get("index.json")
+    oci = _oci_images(docs, index) if isinstance(index, dict) else []
+    out = []
     if isinstance(manifest, list):   # docker save, podman save (docker-archive)
         for e in manifest:
             if isinstance(e, dict) and isinstance(e.get("Layers"), list):
+                cfg = _norm(e["Config"]) if isinstance(e.get("Config"), str) else None
+                digests = {d for d in (_config_digest(cfg),) if d}
+                for o in oci:   # Docker 25+ writes both: take the manifest digests from the index
+                    if cfg and o.get("config") == cfg:
+                        digests |= o["digests"]
                 out.append({"tags": [t for t in e.get("RepoTags") or [] if isinstance(t, str)],
-                            "config": _norm(e["Config"]) if isinstance(e.get("Config"), str) else None,
-                            "layers": [_norm(x) for x in e["Layers"] if isinstance(x, str)],
-                            "layer_digests": [None] * len(e["Layers"])})
+                            "config": cfg, "layers": [_norm(x) for x in e["Layers"] if isinstance(x, str)],
+                            "layer_digests": [None] * len(e["Layers"]), "digests": digests})
         if out:
             return out
-    index = docs.get("index.json")
-    if isinstance(index, dict):      # OCI image layout archive
-        todo = [(d, None) for d in index.get("manifests") or [] if isinstance(d, dict)]
-        seen = 0
-        while todo and seen < 256:
-            seen += 1
-            desc, tag = todo.pop(0)
-            ann = desc.get("annotations") if isinstance(desc.get("annotations"), dict) else {}
-            tag = ann.get("io.containerd.image.name") or ann.get("org.opencontainers.image.ref.name") or tag
-            doc = docs.get(_blob_path(desc.get("digest")))
-            if not isinstance(doc, dict):
-                continue
-            if isinstance(doc.get("manifests"), list):   # an index: one manifest per platform
-                todo.extend((d, tag) for d in doc["manifests"] if isinstance(d, dict))
-                continue
-            if isinstance(doc.get("layers"), list):
-                cfg = doc.get("config") if isinstance(doc.get("config"), dict) else {}
-                plat = _platform(desc.get("platform"))
-                if plat == "unknown/unknown":   # buildx attestation manifests
-                    continue
-                layers = [d for d in doc["layers"] if isinstance(d, dict)]
-                out.append({"tags": [tag] if isinstance(tag, str) else [], "platform": plat,
-                            "config": _blob_path(cfg.get("digest")),
-                            "layers": [_blob_path(d.get("digest")) or "" for d in layers],
-                            "layer_digests": [d.get("digest") for d in layers]})
-        if out:
-            return out
+    if oci:
+        return oci
     raise ValueError(f"no manifest.json or OCI index.json describing an image. {_GUIDE}")
 
 
@@ -550,13 +606,14 @@ class Image:
 
 def _ref(name: str) -> tuple:
     """(repository, tag or None) as Docker normalises a name: docker.io/library/ and
-    docker.io/ are implied, and a colon after the last slash starts the tag."""
+    docker.io/ are implied (and podman's localhost/), a colon after the last slash starts
+    the tag. Callers handle @digest and empty tags before this."""
     name = name.split("@", 1)[0]
     repo, tag = name, None
     i = name.rfind(":")
     if i > name.rfind("/"):
         repo, tag = name[:i], name[i + 1:] or None
-    for prefix in ("docker.io/", "index.docker.io/"):
+    for prefix in ("docker.io/", "index.docker.io/", "localhost/"):   # localhost/: podman's local builds
         if repo.startswith(prefix):
             repo = repo[len(prefix):]
             break
@@ -565,36 +622,73 @@ def _ref(name: str) -> tuple:
     return repo, tag
 
 
+_DIGEST = re.compile(r"[a-z0-9]+:[0-9a-f]{32,}")
+
+
 def _pick(images: list, want: Any, path: str) -> dict:
-    """The image `want` names: an exact tag, then tag:latest, then a repository name, then
-    a platform. More than one match is an error naming them, never a silent first pick."""
-    if want is None:
-        return images[0]
-    if not isinstance(want, str) or not want.strip():
-        raise ValueError("'image' must be a non-empty string (a tag or platform from the archive)")
-    w = want.strip()
-    wr, wt = _ref(w)
-    tiers = (
-        lambda im: _image_name(im) == w,
-        lambda im: w in im["tags"],
-        # as Docker reads names: myapp:1 is docker.io/library/myapp:1, myapp is myapp:latest
-        lambda im: any(_ref(t) == (wr, wt or "latest") for t in im["tags"]),
-        lambda im: wt is None and any(_ref(t)[0] == wr for t in im["tags"]),
-        lambda im: im.get("platform") == w,
-    )
+    """The image `want` names: by digest (name@sha256:..., or the digest alone), else an
+    exact tag, then the name as Docker reads it, then a repository, then a platform. No
+    match or several is an error naming them, never a silent pick of another image."""
     names = "; ".join(_image_name(im) for im in images)
-    for match in tiers:
-        hits = [im for im in images if match(im)]
-        if len(hits) == 1:
-            return hits[0]
-        if hits:
-            raise ValueError(f"'{w}' matches several images in {path}: "
-                             + "; ".join(_image_name(im) for im in hits)
-                             + ". Pass one of these names exactly as written.")
-    raise ValueError(f"no image matching '{w}' in {path}; it holds: {names}")
+    if want is None:
+        chosen = images[0]
+    else:
+        if not isinstance(want, str) or not want.strip():
+            raise ValueError("'image' must be a non-empty string (a tag, digest or platform from the archive)")
+        w = want.strip()
+        name, at, digest = w.partition("@")
+        if not at and _DIGEST.fullmatch(w):
+            name, digest = "", w
+        if at or digest:
+            if not _DIGEST.fullmatch(digest):
+                raise ValueError(f"'{w}' is not a valid image reference: the part after @ must be a digest "
+                                 "such as sha256:<hex>")
+            hits = [im for im in images if digest in im.get("digests", ())]
+            if name:
+                if name.endswith(":"):
+                    raise ValueError(f"'{w}' is not a valid image reference: the tag is empty")
+                repo = _ref(name)[0]
+                hits = [im for im in hits if any(_ref(t)[0] == repo for t in im["tags"])]
+            if not hits:
+                raise ValueError(f"no image with digest {digest} in {path}; it holds: {names}")
+            if len(hits) > 1:
+                raise ValueError(f"digest {digest} matches several images in {path}: "
+                                 + "; ".join(_image_name(im) for im in hits) + ". Add the platform.")
+            chosen = hits[0]
+        else:
+            i = w.rfind(":")
+            if i == len(w) - 1 and i > w.rfind("/"):
+                raise ValueError(f"'{w}' is not a valid image reference: the tag is empty")
+            wr, wt = _ref(w)
+            tiers = (
+                lambda im: _image_name(im) == w,
+                lambda im: w in im["tags"],
+                # as Docker reads names: myapp:1 is docker.io/library/myapp:1, myapp is myapp:latest
+                lambda im: any(_ref(t) == (wr, wt or "latest") for t in im["tags"]),
+                lambda im: wt is None and any(_ref(t)[0] == wr for t in im["tags"]),
+                lambda im: im.get("platform") == w,
+            )
+            chosen = None
+            for match in tiers:
+                hits = [im for im in images if match(im)]
+                if len(hits) == 1:
+                    chosen = hits[0]
+                    break
+                if hits:
+                    raise ValueError(f"'{w}' matches several images in {path}: "
+                                     + "; ".join(_image_name(im) for im in hits)
+                                     + ". Pass one of these names exactly as written.")
+            if chosen is None:
+                raise ValueError(f"no image matching '{w}' in {path}; it holds: {names}")
+    if chosen.get("dropped"):
+        raise ValueError(_dropped_error(chosen["dropped"]))
+    return chosen
 
 
 _JSONISH = re.compile(r"(?:\.json|^repositories|^blobs/[^/]+/[0-9a-f]+)$")
+
+
+_READ_ERRORS = (tarfile.TarError, EOFError, OSError, lzma.LZMAError, zlib.error)
 
 
 def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
@@ -603,15 +697,19 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
     members: dict = {}
     links: dict = {}
     seen: dict = defaultdict(int)
+    prescan: dict = {}   # compressed archives: member name -> its scanned Layer, or why it is not one
     fh, comp = _open_file(path)
     tf = None
     try:
-        outer = _Budget(path)
-        # pass 1: names, and the JSON documents (manifest, index, configs) as bytes
+        budget = _Budget(path)
+        streamed = comp != "none"
+        # One pass over the archive. Uncompressed, layers are read afterwards by seeking
+        # to them. Compressed, there is no seeking back, so every member that is not a
+        # JSON document is read as a layer on the way past, once.
         tf = _outer_tar(fh, comp, path)
         for m in tf:
             tf.members.clear()
-            outer.charge(m.size)
+            budget.charge(m, streamed)
             n = _norm(m.name)
             seen[n] += 1
             if m.issym() or m.islnk():
@@ -620,11 +718,23 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
             if not m.isreg():
                 continue
             members[n] = m
+            f = head = None
             if m.size <= MAX_JSON_BYTES and _JSONISH.search(n):
                 f = tf.extractfile(m)
                 head = f.read(64)
                 if head.lstrip()[:1] in (b"{", b"["):
                     docs.keep(n, head + f.read(MAX_JSON_BYTES))
+                    continue
+            if streamed and m.size > 0:
+                if f is None:
+                    f = tf.extractfile(m)
+                    head = b""
+                L = Layer(0, n)
+                try:
+                    _scan_layer(io.BufferedReader(_Prefixed(head, f), 1 << 20), L, budget)
+                    prescan[n] = L
+                except (_Unsupported, *_READ_ERRORS) as exc:
+                    prescan[n] = exc
         images = _images(docs)
         chosen = _pick(images, want, path)
         others = [_image_name(im) for im in images if im is not chosen]
@@ -650,30 +760,21 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
         for L in layers:
             by_ref[L.ref].append(L)
 
-        # pass 2: the layers themselves, from the same open file
-        budget = _Budget("the layers")
-        done: set = set()
-
-        def scan(ref: str, fobj: Any) -> None:
-            group = by_ref[ref]
-            _scan_layer(fobj, group[0], budget)
-            for L in group[1:]:
-                L.copy_from(group[0])
-            done.add(ref)
-
-        if comp == "none":
-            for ref in by_ref:
-                scan(ref, tf.extractfile(members[ref]))
-        else:   # a compressed archive is a stream: read it again from the start
-            tf.close()
-            tf = _outer_tar(fh, comp, path)
-            for m in tf:
-                tf.members.clear()
-                n = _norm(m.name)
-                if n in by_ref and n not in done:
-                    scan(n, tf.extractfile(m))
-        if len(done) != len(by_ref):
-            raise ValueError(f"{path} changed while it was read; try again")
+        for ref, group in by_ref.items():
+            if not streamed:
+                _scan_layer(tf.extractfile(members[ref]), group[0], budget)
+                source = group[0]
+            else:
+                source = prescan.get(ref)
+                if source is None:
+                    raise ValueError(f"layer {group[0].index} ({ref}) is empty or missing in {path}. {_GUIDE}")
+                if isinstance(source, BaseException):
+                    if isinstance(source, ValueError):
+                        raise ValueError(f"layer {group[0].index}: {source}") from None
+                    raise source
+            for L in group:
+                if L is not source:
+                    L.copy_from(source)
 
         config = docs.get(chosen["config"])
         if isinstance(config, dict) and isinstance(config.get("rootfs"), dict):
@@ -689,7 +790,7 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
         return Image(path, meta, layers, config), others
     except tarfile.TarError as exc:
         raise ValueError(f"{path} could not be read as an image archive ({exc}). {_GUIDE}") from None
-    except (EOFError, OSError, lzma.LZMAError) as exc:
+    except (EOFError, OSError, lzma.LZMAError, zlib.error) as exc:
         raise ValueError(f"{path} is truncated or unreadable ({exc}). {_GUIDE}") from None
     finally:
         if tf is not None:
@@ -889,7 +990,8 @@ def _int_arg(args: dict, key: str, default: int, cap: int, minimum: int = 1) -> 
 # --- Schemas -----------------------------------------------------------------------------------
 _PATH_DESC = ("A saved container image: the tar from docker save -o image.tar <image> or podman save, "
               "or an OCI image archive (skopeo/buildah oci-archive). gzip, bzip2 and xz compression are read.")
-_IMAGE_DESC = "When the archive holds several images or platforms: the tag or platform (linux/arm64) to read."
+_IMAGE_DESC = ("When the archive holds several images or platforms: the one to read, by tag (myapp:1), "
+               "digest (myapp@sha256:...) or platform (linux/arm64).")
 
 IMAGE_SUMMARY = {
     "name": "image_summary",
