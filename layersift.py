@@ -42,15 +42,11 @@ from typing import Any, Optional
 # --- Bounds ---------------------------------------------------------------------------
 MAX_ARCHIVE_BYTES = 64 * 1024 ** 3       # the saved tar itself
 MAX_JSON_BYTES = 8 * 1024 * 1024         # manifest, index and config documents
-MAX_UNPACKED_BYTES = 256 * 1024 ** 3     # file sizes declared across all layers
+MAX_UNPACKED_BYTES = 64 * 1024 ** 3      # contents declared per archive and across its layers (~2.5 s/GiB to read)
 MAX_ENTRIES = 3_000_000                  # tar entries across all layers
 MAX_LAYERS = 1_000
 MAX_META_BYTES = 64 * 1024 * 1024        # all JSON-looking members kept from one archive
 MAX_HEADER_BYTES = 1024 * 1024           # one long-name or pax extended header
-# A compressed stream may expand to this much (declared) before it is treated as a bomb.
-# Real archives hold already-compressed layers or ordinary files: a few times their size.
-BOMB_RATIO = 20
-BOMB_SLACK = 256 * 1024 * 1024
 DEFAULT_TOP = 15
 HARD_TOP = 200
 MIB = 1024 * 1024
@@ -201,15 +197,15 @@ def _tar(fileobj: Any, mode: str) -> tarfile.TarFile:
 
 
 class _Budget:
-    """Caps the work a crafted archive can cause: entries and declared bytes read. For a
-    compressed stream, `stored` is its size on disk: declared contents far beyond it are
-    a decompression bomb, refused at the header, before any of it is read."""
+    """Caps the work a crafted archive can cause: entries, and the file bytes headers
+    declare, charged at each header before its data is read or decompressed. There is no
+    ratio test: a real layer of zeros (a sparse lastlog) compresses about 1000:1, as a
+    bomb does; the absolute cap is what bounds the time a stream can take."""
 
-    def __init__(self, what: str, stored: Optional[int] = None) -> None:
+    def __init__(self, what: str) -> None:
         self.what = what
         self.entries = 0
         self.bytes = 0
-        self.limit = MAX_UNPACKED_BYTES if stored is None else min(MAX_UNPACKED_BYTES, BOMB_RATIO * stored + BOMB_SLACK)
 
     def charge(self, size: int) -> None:
         if size < 0:
@@ -218,11 +214,9 @@ class _Budget:
         self.bytes += size
         if self.entries > MAX_ENTRIES:
             raise ValueError(f"more than {MAX_ENTRIES} entries in {self.what}; refusing to read further")
-        if self.bytes > self.limit:
-            if self.limit < MAX_UNPACKED_BYTES:
-                raise ValueError(f"{self.what} would decompress to more than {self.limit} bytes, "
-                                 f"{BOMB_RATIO}x its compressed size; refusing it as a possible decompression bomb")
-            raise ValueError(f"{self.what} declares more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB of files; refusing")
+        if self.bytes > MAX_UNPACKED_BYTES:
+            raise ValueError(f"{self.what} declares more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB of "
+                             "contents; refusing to read further")
 
 
 def _norm(name: str) -> str:
@@ -264,18 +258,14 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
     if comp == "none" and seekable:
         fobj.seek(0)   # uncompressed and seekable: skip file contents instead of reading them
         tf = _tar(fobj, "r:")
-        bomb = None
     else:
         tf = _tar(_decompressed(io.BufferedReader(_Prefixed(head, fobj), 1 << 20), comp), "r|")
-        bomb = _Budget(f"layer {layer.index}", layer.archive_bytes) if comp != "none" else None
     with tf:
         for m in tf:
             # TarFile keeps every header it has read; a layer can hold hundreds of
             # thousands. Nothing here needs them again, so do not let them pile up.
             tf.members.clear()
             budget.charge(m.size)
-            if bomb:
-                bomb.charge(m.size)
             p = _norm(m.name)
             if not p:
                 continue
@@ -305,7 +295,7 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
             layer.adds.append((p, size, kind, target))
 
 
-def _open_file(path: str) -> tuple[Any, str, int]:
+def _open_file(path: str) -> tuple[Any, str]:
     """Open once, without blocking, and check what was opened: the path may have been
     swapped for a FIFO since it was checked. Both passes read this same handle."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
@@ -319,7 +309,7 @@ def _open_file(path: str) -> tuple[Any, str, int]:
         _check_codec(comp, path)
         if comp == "none" and head.lstrip()[:1] in (b"{", b"["):
             raise ValueError(f"{path} is JSON, not an image archive. {_GUIDE}")
-        return fh, comp, st.st_size
+        return fh, comp
     except BaseException:
         fh.close()
         raise
@@ -375,16 +365,23 @@ class _Docs:
     def __init__(self) -> None:
         self.raw: dict = {}
         self.parsed: dict = {}
+        self.dropped: set = set()
         self.total = 0
 
     def keep(self, name: str, data: bytes) -> None:
+        # Past the cap, later documents are not kept (attestation and SBOM blobs can be
+        # large and are never read); it is an error only if an image then needs one.
+        if self.total + len(data) > MAX_META_BYTES:
+            self.dropped.add(name)
+            return
         self.total += len(data)
-        if self.total > MAX_META_BYTES:
-            raise ValueError(f"the archive holds more than {MAX_META_BYTES // MIB} MiB of JSON documents; refusing")
         self.raw[name] = data
         self.parsed.pop(name, None)
 
     def get(self, name: Any) -> Any:
+        if isinstance(name, str) and name in self.dropped and name not in self.raw:
+            raise ValueError(f"the archive holds more than {MAX_META_BYTES // MIB} MiB of JSON documents and "
+                             f"{name}, which the image needs, is past that limit; refusing")
         if not isinstance(name, str) or name not in self.raw:
             return None
         if name not in self.parsed:
@@ -487,10 +484,9 @@ class Image:
                 if held is not None:
                     self.links_to[held].discard(p)
                 continue
-            if e[0] <= 0:
-                continue
             # Removing one name of a hardlinked file removes no bytes while another name
-            # survives: that name now holds the data.
+            # survives: that name now holds the data (even an empty file's, so no link is
+            # left pointing at a path a later, different file will take).
             alive = sorted(x for x in self.links_to.pop(p, ()) if self.fs.get(x, (0, 0, ""))[2] == "h")
             if alive:
                 heir, rest = alive[0], alive[1:]
@@ -499,6 +495,8 @@ class Image:
                 for x in rest:
                     self.link_of[x] = heir
                     self.links_to[heir].add(x)
+                continue
+            if e[0] <= 0:
                 continue
             row = (p, e[0], e[1], by, how)
             self.waste.append(row)
@@ -550,6 +548,23 @@ class Image:
         return f"layer {index}" + (f" ({L.instruction[:120]})" if L.instruction else "")
 
 
+def _ref(name: str) -> tuple:
+    """(repository, tag or None) as Docker normalises a name: docker.io/library/ and
+    docker.io/ are implied, and a colon after the last slash starts the tag."""
+    name = name.split("@", 1)[0]
+    repo, tag = name, None
+    i = name.rfind(":")
+    if i > name.rfind("/"):
+        repo, tag = name[:i], name[i + 1:] or None
+    for prefix in ("docker.io/", "index.docker.io/"):
+        if repo.startswith(prefix):
+            repo = repo[len(prefix):]
+            break
+    if repo.startswith("library/") and repo.count("/") == 1:
+        repo = repo[len("library/"):]
+    return repo, tag
+
+
 def _pick(images: list, want: Any, path: str) -> dict:
     """The image `want` names: an exact tag, then tag:latest, then a repository name, then
     a platform. More than one match is an error naming them, never a silent first pick."""
@@ -558,11 +573,13 @@ def _pick(images: list, want: Any, path: str) -> dict:
     if not isinstance(want, str) or not want.strip():
         raise ValueError("'image' must be a non-empty string (a tag or platform from the archive)")
     w = want.strip()
+    wr, wt = _ref(w)
     tiers = (
         lambda im: _image_name(im) == w,
         lambda im: w in im["tags"],
-        lambda im: w + ":latest" in im["tags"],
-        lambda im: any(t.rsplit(":", 1)[0] == w for t in im["tags"] if "/" not in t[t.rfind(":"):]),
+        # as Docker reads names: myapp:1 is docker.io/library/myapp:1, myapp is myapp:latest
+        lambda im: any(_ref(t) == (wr, wt or "latest") for t in im["tags"]),
+        lambda im: wt is None and any(_ref(t)[0] == wr for t in im["tags"]),
         lambda im: im.get("platform") == w,
     )
     names = "; ".join(_image_name(im) for im in images)
@@ -586,10 +603,10 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
     members: dict = {}
     links: dict = {}
     seen: dict = defaultdict(int)
-    fh, comp, stored = _open_file(path)
+    fh, comp = _open_file(path)
     tf = None
     try:
-        outer = _Budget(path, stored if comp != "none" else None)
+        outer = _Budget(path)
         # pass 1: names, and the JSON documents (manifest, index, configs) as bytes
         tf = _outer_tar(fh, comp, path)
         for m in tf:

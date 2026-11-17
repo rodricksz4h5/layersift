@@ -64,8 +64,9 @@ hermes plugins install rodricksz4h5/layersift --enable
 - Reading a layer means reading every tar header in it with Python's `tarfile`:
   under a second for a typical image, a few seconds for one with hundreds of
   thousands of files.
-- A compressed archive or layer whose contents declare more than 20 times its
-  compressed size (plus 256 MB) is refused as a likely decompression bomb.
+- An archive whose contents declare more than 64 GiB, or more than 3 million tar
+  entries, is refused before it is read; a crafted compressed archive therefore costs
+  at most a few minutes of reading.
 - An archive that names the same layer file twice is refused as ambiguous.
 - Leftover findings are path patterns; a cache directory the image needs at run time
   will still be reported.
