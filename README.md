@@ -62,7 +62,11 @@ hermes plugins install rodricksz4h5/layersift --enable
   not include filesystem block overhead, so `docker images` (which reports disk
   use) can show a somewhat larger number.
 - Reading a layer means reading every tar header in it with Python's `tarfile`:
-  about a second for a typical image, around ten seconds per hundred thousand files.
+  under a second for a typical image, a few seconds for one with hundreds of
+  thousands of files.
+- A compressed archive or layer whose contents declare more than 20 times its
+  compressed size (plus 256 MB) is refused as a likely decompression bomb.
+- An archive that names the same layer file twice is refused as ambiguous.
 - Leftover findings are path patterns; a cache directory the image needs at run time
   will still be reported.
 
@@ -72,9 +76,10 @@ Standard library only, no dependencies. No network, never runs `docker` or any o
 program, no registry, no credentials, no background work, no self-update. Archives
 are read, never extracted: nothing is written to disk. Only regular files are read;
 `/proc` and `/dev` paths, FIFOs, sockets and Windows device paths are refused, and
-every path goes through Hermes' read denylist. Archive size, tar entries and the
-file bytes declared across layers are capped, so a crafted archive cannot make it
-read without end.
+every path goes through Hermes' read denylist. Archive size, tar entries, long-name
+and pax headers, JSON metadata, the file bytes declared across layers and the
+expansion of compressed data are all capped, so a crafted archive cannot make it
+read or allocate without end.
 
 ## License
 

@@ -25,8 +25,11 @@ background work, no self-update. The only side effect is reading the path given.
 
 from __future__ import annotations
 
+import bz2
+import gzip
 import io
 import json
+import lzma
 import os
 import posixpath
 import re
@@ -42,6 +45,12 @@ MAX_JSON_BYTES = 8 * 1024 * 1024         # manifest, index and config documents
 MAX_UNPACKED_BYTES = 256 * 1024 ** 3     # file sizes declared across all layers
 MAX_ENTRIES = 3_000_000                  # tar entries across all layers
 MAX_LAYERS = 1_000
+MAX_META_BYTES = 64 * 1024 * 1024        # all JSON-looking members kept from one archive
+MAX_HEADER_BYTES = 1024 * 1024           # one long-name or pax extended header
+# A compressed stream may expand to this much (declared) before it is treated as a bomb.
+# Real archives hold already-compressed layers or ordinary files: a few times their size.
+BOMB_RATIO = 20
+BOMB_SLACK = 256 * 1024 * 1024
 DEFAULT_TOP = 15
 HARD_TOP = 200
 MIB = 1024 * 1024
@@ -130,7 +139,19 @@ def _compression(head: bytes) -> str:
     return "none"
 
 
-_STREAM_MODE = {"none": "r|", "gzip": "r|gz", "bzip2": "r|bz2", "xz": "r|xz", "zstd": "r|zst"}
+def _decompressed(fileobj: Any, comp: str) -> Any:
+    """A reader of the decompressed bytes. tarfile's own "r|gz" streams decompress in
+    small Python-level steps (8 MB/s on very compressible data); these readers run in C."""
+    if comp == "gzip":
+        return gzip.GzipFile(fileobj=fileobj, mode="rb")
+    if comp == "bzip2":
+        return bz2.BZ2File(fileobj, mode="rb")
+    if comp == "xz":
+        return lzma.LZMAFile(fileobj, mode="rb")
+    if comp == "zstd":
+        from compression import zstd  # Python 3.14+, checked by _check_codec
+        return zstd.ZstdFile(fileobj, mode="rb")
+    return fileobj
 
 
 def _check_codec(comp: str, what: str) -> None:
@@ -159,20 +180,49 @@ class _Prefixed(io.RawIOBase):
         return len(data)
 
 
-class _Budget:
-    """Caps the work a crafted archive can cause: entries and declared bytes read."""
+class _TarInfo(tarfile.TarInfo):
+    """tarfile reads a GNU long name or a pax header whole, at whatever size its header
+    declares, before handing the member back. Refuse oversized ones before that read."""
 
-    def __init__(self) -> None:
+    def _proc_member(self, tarfile_: Any) -> Any:
+        if self.size < 0:
+            raise ValueError("a tar header declares a negative size; refusing the archive")
+        if self.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE,
+                         tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE) and self.size > MAX_HEADER_BYTES:
+            raise ValueError(f"a tar header declares {self.size} bytes of long name or attributes "
+                             f"(the limit is {MAX_HEADER_BYTES}); refusing the archive")
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise ValueError("a tar header is a GNU sparse file, which container images do not use; refusing")
+        return super()._proc_member(tarfile_)
+
+
+def _tar(fileobj: Any, mode: str) -> tarfile.TarFile:
+    return tarfile.open(fileobj=fileobj, mode=mode, tarinfo=_TarInfo)
+
+
+class _Budget:
+    """Caps the work a crafted archive can cause: entries and declared bytes read. For a
+    compressed stream, `stored` is its size on disk: declared contents far beyond it are
+    a decompression bomb, refused at the header, before any of it is read."""
+
+    def __init__(self, what: str, stored: Optional[int] = None) -> None:
+        self.what = what
         self.entries = 0
         self.bytes = 0
+        self.limit = MAX_UNPACKED_BYTES if stored is None else min(MAX_UNPACKED_BYTES, BOMB_RATIO * stored + BOMB_SLACK)
 
     def charge(self, size: int) -> None:
+        if size < 0:
+            raise ValueError("a tar header declares a negative size; refusing the archive")
         self.entries += 1
-        self.bytes += max(size, 0)
+        self.bytes += size
         if self.entries > MAX_ENTRIES:
-            raise ValueError(f"more than {MAX_ENTRIES} entries across the layers; refusing to read further")
-        if self.bytes > MAX_UNPACKED_BYTES:
-            raise ValueError(f"layers declare more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB of files; refusing")
+            raise ValueError(f"more than {MAX_ENTRIES} entries in {self.what}; refusing to read further")
+        if self.bytes > self.limit:
+            if self.limit < MAX_UNPACKED_BYTES:
+                raise ValueError(f"{self.what} would decompress to more than {self.limit} bytes, "
+                                 f"{BOMB_RATIO}x its compressed size; refusing it as a possible decompression bomb")
+            raise ValueError(f"{self.what} declares more than {MAX_UNPACKED_BYTES // 1024 ** 3} GiB of files; refusing")
 
 
 def _norm(name: str) -> str:
@@ -189,7 +239,8 @@ class Layer:
         self.created: Optional[str] = None
         self.archive_bytes = 0        # as stored in the archive (compressed or not)
         self.compression = "none"
-        self.adds: list = []          # (path, size, kind) kind: f file, d dir, l symlink, h hardlink, o other
+        self.adds: list = []          # (path, size, kind, hardlink target) kind: f file, d dir, l symlink, h hardlink, o other
+        self.diff_id: Optional[str] = None   # digest of the uncompressed layer, from the image config
         self.whiteouts: list = []     # paths this layer deletes from lower layers
         self.opaque: list = []        # directories whose lower contents this layer hides
         self.size = 0                 # bytes of regular files this layer adds
@@ -212,25 +263,32 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
         seekable = False
     if comp == "none" and seekable:
         fobj.seek(0)   # uncompressed and seekable: skip file contents instead of reading them
-        tf = tarfile.open(fileobj=fobj, mode="r:")
+        tf = _tar(fobj, "r:")
+        bomb = None
     else:
-        tf = tarfile.open(fileobj=io.BufferedReader(_Prefixed(head, fobj), 1 << 20), mode=_STREAM_MODE[comp])
+        tf = _tar(_decompressed(io.BufferedReader(_Prefixed(head, fobj), 1 << 20), comp), "r|")
+        bomb = _Budget(f"layer {layer.index}", layer.archive_bytes) if comp != "none" else None
     with tf:
         for m in tf:
             # TarFile keeps every header it has read; a layer can hold hundreds of
             # thousands. Nothing here needs them again, so do not let them pile up.
             tf.members.clear()
             budget.charge(m.size)
+            if bomb:
+                bomb.charge(m.size)
             p = _norm(m.name)
             if not p:
                 continue
             parent, base = posixpath.split(p)
-            if base == ".wh..wh..opq":
-                layer.opaque.append(parent)
-                continue
+            if base.startswith(".wh..wh."):
+                if base == ".wh..wh..opq":
+                    layer.opaque.append(parent)
+                continue   # other .wh..wh. names are AUFS bookkeeping (.wh..wh.plnk), not deletions
             if base.startswith(".wh."):
-                layer.whiteouts.append(posixpath.join(parent, base[4:]))
+                if base[4:] not in ("", ".", ".."):
+                    layer.whiteouts.append(posixpath.join(parent, base[4:]))
                 continue
+            target = None
             if m.isreg():
                 kind, size = "f", m.size
                 layer.size += size
@@ -241,36 +299,38 @@ def _scan_layer(fobj: Any, layer: Layer, budget: _Budget) -> None:
                 kind, size = "l", 0
             elif m.islnk():
                 kind, size = "h", 0   # shares data with its target: no bytes of its own
+                target = _norm(m.linkname)
             else:
                 kind, size = "o", 0
-            layer.adds.append((p, size, kind))
+            layer.adds.append((p, size, kind, target))
 
 
-def _open_archive(path: str) -> tuple[Any, tarfile.TarFile, str]:
-    # open without blocking and check what was opened: the path may have been swapped
-    # for a FIFO since it was checked
+def _open_file(path: str) -> tuple[Any, str, int]:
+    """Open once, without blocking, and check what was opened: the path may have been
+    swapped for a FIFO since it was checked. Both passes read this same handle."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     fh = os.fdopen(fd, "rb")
     try:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
             raise ValueError(f"Refusing to read {path}: not a regular file")
         head = fh.read(512)
-        fh.seek(0)
         comp = _compression(head)
         _check_codec(comp, path)
-        if comp == "none":
-            if head.lstrip()[:1] in (b"{", b"["):
-                raise ValueError(f"{path} is JSON, not an image archive. {_GUIDE}")
-            tf = tarfile.open(fileobj=fh, mode="r:")
-        else:
-            tf = tarfile.open(fileobj=fh, mode=_STREAM_MODE[comp])
-        return fh, tf, comp
-    except tarfile.TarError as exc:
-        fh.close()
-        raise ValueError(f"{path} is not a tar archive ({exc}). {_GUIDE}") from None
+        if comp == "none" and head.lstrip()[:1] in (b"{", b"["):
+            raise ValueError(f"{path} is JSON, not an image archive. {_GUIDE}")
+        return fh, comp, st.st_size
     except BaseException:
         fh.close()
         raise
+
+
+def _outer_tar(fh: Any, comp: str, path: str) -> tarfile.TarFile:
+    fh.seek(0)
+    try:
+        return _tar(fh, "r:") if comp == "none" else _tar(_decompressed(fh, comp), "r|")
+    except tarfile.TarError as exc:
+        raise ValueError(f"{path} is not a tar archive ({exc}). {_GUIDE}") from None
 
 
 def _link_target(m: tarfile.TarInfo) -> str:
@@ -308,7 +368,34 @@ def _platform(p: Any) -> Optional[str]:
     return None
 
 
-def _images(docs: dict) -> list:
+class _Docs:
+    """JSON members kept as bytes in pass 1 and parsed only when an image refers to them,
+    so a crafted archive full of large JSON files costs a byte cap, not a parse each."""
+
+    def __init__(self) -> None:
+        self.raw: dict = {}
+        self.parsed: dict = {}
+        self.total = 0
+
+    def keep(self, name: str, data: bytes) -> None:
+        self.total += len(data)
+        if self.total > MAX_META_BYTES:
+            raise ValueError(f"the archive holds more than {MAX_META_BYTES // MIB} MiB of JSON documents; refusing")
+        self.raw[name] = data
+        self.parsed.pop(name, None)
+
+    def get(self, name: Any) -> Any:
+        if not isinstance(name, str) or name not in self.raw:
+            return None
+        if name not in self.parsed:
+            try:
+                self.parsed[name] = json.loads(self.raw[name])
+            except (ValueError, RecursionError):
+                self.parsed[name] = None
+        return self.parsed[name]
+
+
+def _images(docs: _Docs) -> list:
     """Every image the archive holds: tags, config member, layer members (bottom first)."""
     out = []
     manifest = docs.get("manifest.json")
@@ -330,7 +417,7 @@ def _images(docs: dict) -> list:
             desc, tag = todo.pop(0)
             ann = desc.get("annotations") if isinstance(desc.get("annotations"), dict) else {}
             tag = ann.get("io.containerd.image.name") or ann.get("org.opencontainers.image.ref.name") or tag
-            doc = docs.get(_blob_path(desc.get("digest")) or "")
+            doc = docs.get(_blob_path(desc.get("digest")))
             if not isinstance(doc, dict):
                 continue
             if isinstance(doc.get("manifests"), list):   # an index: one manifest per platform
@@ -363,6 +450,8 @@ class Image:
         self.children: dict = defaultdict(set)  # dir path -> child paths
         self.waste: list = []                   # (path, size, added in, removed by, how)
         self.overwrites_by: dict = defaultdict(list)   # layer index -> waste rows it causes
+        self.link_of: dict = {}                 # hardlink path -> the file path holding its data
+        self.links_to: dict = defaultdict(set)  # file path -> hardlinks sharing its data
         self._map_history()
         for layer in layers:
             self._apply(layer)
@@ -391,10 +480,29 @@ class Image:
             if p == path:   # descendants' parent sets were popped above
                 self.children.get(posixpath.dirname(p), set()).discard(p)
             e = self.fs.pop(p, None)
-            if e is not None and e[0] > 0:
-                row = (p, e[0], e[1], by, how)
-                self.waste.append(row)
-                self.overwrites_by[by].append(row)
+            if e is None:
+                continue
+            if e[2] == "h":
+                held = self.link_of.pop(p, None)
+                if held is not None:
+                    self.links_to[held].discard(p)
+                continue
+            if e[0] <= 0:
+                continue
+            # Removing one name of a hardlinked file removes no bytes while another name
+            # survives: that name now holds the data.
+            alive = sorted(x for x in self.links_to.pop(p, ()) if self.fs.get(x, (0, 0, ""))[2] == "h")
+            if alive:
+                heir, rest = alive[0], alive[1:]
+                self.link_of.pop(heir, None)
+                self.fs[heir] = (e[0], e[1], "f")
+                for x in rest:
+                    self.link_of[x] = heir
+                    self.links_to[heir].add(x)
+                continue
+            row = (p, e[0], e[1], by, how)
+            self.waste.append(row)
+            self.overwrites_by[by].append(row)
 
     def _apply(self, layer: Layer) -> None:
         i = layer.index
@@ -403,7 +511,16 @@ class Image:
                 self._drop(child, i, "hidden")
         for p in layer.whiteouts:
             self._drop(p, i, "deleted")
-        for p, size, kind in layer.adds:
+        for p, size, kind, target in layer.adds:
+            # a/b replaces a lower-layer file named a, even when this layer has no entry for a
+            a = posixpath.dirname(p)
+            while a:
+                e = self.fs.get(a)
+                if e is not None:
+                    if e[2] not in ("d", "l"):
+                        self._drop(a, i, "overwritten")
+                    break
+                a = posixpath.dirname(a)
             old = self.fs.get(p)
             if old is not None:
                 if old[2] == "d" and kind == "d":
@@ -411,6 +528,11 @@ class Image:
                 self._drop(p, i, "overwritten")
             self.fs[p] = (size, i, kind)
             self._link(p)
+            if kind == "h" and target:
+                held = self.link_of.get(target, target)   # a link to a link shares the first file's data
+                if self.fs.get(held, (0, 0, ""))[2] == "f":
+                    self.link_of[p] = held
+                    self.links_to[held].add(p)
 
     def _link(self, p: str) -> None:
         """Index p under its parent, and each missing ancestor under its own: a layer may
@@ -428,43 +550,66 @@ class Image:
         return f"layer {index}" + (f" ({L.instruction[:120]})" if L.instruction else "")
 
 
+def _pick(images: list, want: Any, path: str) -> dict:
+    """The image `want` names: an exact tag, then tag:latest, then a repository name, then
+    a platform. More than one match is an error naming them, never a silent first pick."""
+    if want is None:
+        return images[0]
+    if not isinstance(want, str) or not want.strip():
+        raise ValueError("'image' must be a non-empty string (a tag or platform from the archive)")
+    w = want.strip()
+    tiers = (
+        lambda im: _image_name(im) == w,
+        lambda im: w in im["tags"],
+        lambda im: w + ":latest" in im["tags"],
+        lambda im: any(t.rsplit(":", 1)[0] == w for t in im["tags"] if "/" not in t[t.rfind(":"):]),
+        lambda im: im.get("platform") == w,
+    )
+    names = "; ".join(_image_name(im) for im in images)
+    for match in tiers:
+        hits = [im for im in images if match(im)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise ValueError(f"'{w}' matches several images in {path}: "
+                             + "; ".join(_image_name(im) for im in hits)
+                             + ". Pass one of these names exactly as written.")
+    raise ValueError(f"no image matching '{w}' in {path}; it holds: {names}")
+
+
+_JSONISH = re.compile(r"(?:\.json|^repositories|^blobs/[^/]+/[0-9a-f]+)$")
+
+
 def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
     path = _resolve(raw, name)
-    budget = _Budget()
-    docs: dict = {}
+    docs = _Docs()
     members: dict = {}
     links: dict = {}
-    fh, tf, comp = _open_archive(path)
+    seen: dict = defaultdict(int)
+    fh, comp, stored = _open_file(path)
+    tf = None
     try:
-        # pass 1: names, and the small JSON documents (manifest, index, configs)
+        outer = _Budget(path, stored if comp != "none" else None)
+        # pass 1: names, and the JSON documents (manifest, index, configs) as bytes
+        tf = _outer_tar(fh, comp, path)
         for m in tf:
+            tf.members.clear()
+            outer.charge(m.size)
             n = _norm(m.name)
+            seen[n] += 1
             if m.issym() or m.islnk():
                 links[n] = _link_target(m)
                 continue
             if not m.isreg():
                 continue
             members[n] = m
-            if m.size <= MAX_JSON_BYTES and (n.endswith(".json") or n.startswith("blobs/") or n == "repositories"):
-                data = tf.extractfile(m).read(MAX_JSON_BYTES + 1)
-                if data.lstrip()[:1] in (b"{", b"["):
-                    try:
-                        docs[n] = json.loads(data)
-                    except (ValueError, RecursionError):
-                        pass
+            if m.size <= MAX_JSON_BYTES and _JSONISH.search(n):
+                f = tf.extractfile(m)
+                head = f.read(64)
+                if head.lstrip()[:1] in (b"{", b"["):
+                    docs.keep(n, head + f.read(MAX_JSON_BYTES))
         images = _images(docs)
-        others = []
-        chosen = images[0]
-        if want is not None:
-            if not isinstance(want, str) or not want.strip():
-                raise ValueError("'image' must be a non-empty string (a tag or platform from the archive)")
-            w = want.strip()
-            hits = [im for im in images if w in im["tags"] or w == im.get("platform")
-                    or any(w in t for t in im["tags"])]
-            if not hits:
-                raise ValueError(f"no image matching '{w}' in {path}; it holds: "
-                                 + "; ".join(_image_name(im) for im in images))
-            chosen = hits[0]
+        chosen = _pick(images, want, path)
         others = [_image_name(im) for im in images if im is not chosen]
         if len(chosen["layers"]) > MAX_LAYERS:
             raise ValueError(f"the image has {len(chosen['layers'])} layers, over the {MAX_LAYERS} limit")
@@ -472,6 +617,8 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
         def resolve(n: str) -> str:
             for _ in range(8):
                 if n in members:
+                    if seen[n] > 1:
+                        raise ValueError(f"{n} appears {seen[n]} times in {path}; refusing an ambiguous archive")
                     return n
                 if n not in links:
                     break
@@ -486,40 +633,50 @@ def _load(raw: Any, name: str = "path", want: Any = None) -> tuple[Image, list]:
         for L in layers:
             by_ref[L.ref].append(L)
 
-        # pass 2: the layers themselves
+        # pass 2: the layers themselves, from the same open file
+        budget = _Budget("the layers")
+        done: set = set()
+
+        def scan(ref: str, fobj: Any) -> None:
+            group = by_ref[ref]
+            _scan_layer(fobj, group[0], budget)
+            for L in group[1:]:
+                L.copy_from(group[0])
+            done.add(ref)
+
         if comp == "none":
-            for ref, group in by_ref.items():
-                _scan_layer(tf.extractfile(members[ref]), group[0], budget)
-                for L in group[1:]:
-                    L.copy_from(group[0])
-        else:   # a compressed archive is read as a stream: read it again in order
+            for ref in by_ref:
+                scan(ref, tf.extractfile(members[ref]))
+        else:   # a compressed archive is a stream: read it again from the start
             tf.close()
-            fh.close()
-            fh, tf, comp = _open_archive(path)
+            tf = _outer_tar(fh, comp, path)
             for m in tf:
+                tf.members.clear()
                 n = _norm(m.name)
-                if n in by_ref:
-                    group = by_ref[n]
-                    _scan_layer(tf.extractfile(m), group[0], budget)
-                    for L in group[1:]:
-                        L.copy_from(group[0])
-        config = docs.get(chosen["config"] or "")
+                if n in by_ref and n not in done:
+                    scan(n, tf.extractfile(m))
+        if len(done) != len(by_ref):
+            raise ValueError(f"{path} changed while it was read; try again")
+
+        config = docs.get(chosen["config"])
         if isinstance(config, dict) and isinstance(config.get("rootfs"), dict):
             diff_ids = config["rootfs"].get("diff_ids")
             if isinstance(diff_ids, list) and len(diff_ids) == len(layers):
                 for L, d in zip(layers, diff_ids):
-                    if not L.digest and isinstance(d, str):
-                        L.digest = d
+                    if isinstance(d, str):
+                        L.diff_id = d
+                        L.digest = L.digest or d
         meta = {"tags": chosen["tags"], "platform": chosen.get("platform")}
         if isinstance(config, dict) and not meta["platform"]:
             meta["platform"] = _platform(config)
         return Image(path, meta, layers, config), others
     except tarfile.TarError as exc:
         raise ValueError(f"{path} could not be read as an image archive ({exc}). {_GUIDE}") from None
-    except (EOFError, OSError) as exc:
+    except (EOFError, OSError, lzma.LZMAError) as exc:
         raise ValueError(f"{path} is truncated or unreadable ({exc}). {_GUIDE}") from None
     finally:
-        tf.close()
+        if tf is not None:
+            tf.close()
         fh.close()
 
 
@@ -655,15 +812,18 @@ def _buckets(fs: dict, depth: int = 3) -> dict:
 
 def _largest_dirs(sizes: dict, top: int) -> list:
     """Directories two or three levels down, skipping one that is mostly a single child."""
+    biggest_child: dict = defaultdict(int)
+    for d, size in sizes.items():
+        if d.count("/") == 2:
+            parent = d.rsplit("/", 1)[0]
+            biggest_child[parent] = max(biggest_child[parent], size)
     rows = []
     for d, size in sizes.items():
         depth = d.count("/") + 1
         if depth not in (2, 3):
             continue
-        if depth == 2:
-            kids = [s for k, s in sizes.items() if k.startswith(d + "/") and k.count("/") == 2]
-            if kids and max(kids) >= 0.8 * size:
-                continue
+        if depth == 2 and biggest_child.get(d, 0) >= 0.8 * size:
+            continue
         rows.append((size, d))
     rows.sort(reverse=True)
     return [{"dir": "/" + d, **_sz(s)} for s, d in rows[:top]]
@@ -801,7 +961,7 @@ def image_layer(args: dict, **kwargs) -> str:
             out["digest"] = L.digest
         if L.created:
             out["created"] = L.created
-        adds = {p: (s, n, k) for p, s, k in L.adds}
+        adds = {p: (s, n, k) for p, s, k, _ in L.adds}
         out["largest_files"] = _files(adds.items(), top)
         out["largest_dirs"] = _largest_dirs(_dir_sizes(adds), top)
         later = defaultdict(lambda: [0, 0])
@@ -828,9 +988,15 @@ def image_layer(args: dict, **kwargs) -> str:
 
 
 def _shared_bottom(b: Image, h: Image) -> int:
+    """Identical bottom layers. diff_ids (digests of the uncompressed layers, from each
+    image's config) match across formats; blob digests differ once a layer is compressed."""
     n = 0
     for x, y in zip(b.layers, h.layers):
-        if x.digest and x.digest == y.digest:
+        if x.diff_id and y.diff_id:
+            same = x.diff_id == y.diff_id
+        else:
+            same = bool(x.digest) and x.digest == y.digest
+        if same:
             n += 1
         else:
             break
